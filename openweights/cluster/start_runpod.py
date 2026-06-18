@@ -17,10 +17,12 @@ TTL (Time To Live) Feature:
 Note: possible unknown error with echo when running the script.
 """
 
+import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from threading import RLock
 from typing import Callable, Dict, List, Optional
@@ -32,11 +34,15 @@ import runpod
 from dotenv import load_dotenv
 from scp import SCPClient
 
+from openweights.images import OW_UNSLOTH_IMAGE, OW_VLLM_IMAGE
+
+logger = logging.getLogger(__name__)
+
 IMAGES = {
-    "default": "nielsrolf/ow-default",
-    "inference": "nielsrolf/ow-inference-v2",
-    "inference-debugging": "nielsrolf/ow-inference-v2-debugging",
-    "finetuning": "nielsrolf/ow-unsloth-v2",
+    "default": OW_UNSLOTH_IMAGE,
+    "inference": OW_VLLM_IMAGE,
+    "inference-debugging": OW_VLLM_IMAGE,
+    "finetuning": OW_UNSLOTH_IMAGE,
     "torch": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
 }
 
@@ -82,9 +88,13 @@ GPUs = {
 VERIFIED_GPUs = {
     # References found at https://rest.runpod.io/v1/docs#v-0-106
     # GPUs for compute-intensive tasks (e.g. LoRAfinetuning)
-    # "6000Ada": "NVIDIA RTX 6000 Ada Generation", # Not available with cuda 12.8
-    # "4000Ada": "NVIDIA RTX 4000 Ada Generation",
-    "L40": "NVIDIA L40",
+    "6000Ada": "NVIDIA RTX 6000 Ada Generation",
+    # "4000Ada": "NVIDIA RTX 4000 Ada Generation",  # untested (no RunPod stock)
+    # L40 pods currently pass RunPod availability checks but frequently disappear
+    # before the worker process starts on the CUDA 12.8 images.
+    # Keep L40 in GPUS for explicit allowed_hardware requests, but do not select it
+    # automatically for production workers.
+    # "L40": "NVIDIA L40",
     # "L40S": "NVIDIA L40S", # not available with cuda 12.8
     # "A30": "NVIDIA A30", # not available with cuda 12.8
     #
@@ -99,7 +109,7 @@ VERIFIED_GPUs = {
     #
     # Below, GPUs are cost inefficient
     # "RTX4080": "NVIDIA GeForce RTX 4080",
-    # "RTX3090": "NVIDIA GeForce RTX 3090",
+    "RTX3090": "NVIDIA GeForce RTX 3090",
     # "RTX3090Ti": "NVIDIA GeForce RTX 3090 Ti",
     # "V100": "Tesla V100-SXM2-32GB",  # Default V100 - 32GB
     # "V100_32": "Tesla V100-SXM2-32GB",
@@ -116,22 +126,96 @@ VERIFIED_GPUs = {
     # "A2000": "NVIDIA RTX A2000",
     # "RTX4090": "NVIDIA GeForce RTX 4090",
     # "A5000": "NVIDIA RTX A5000",
-    # "A40": "NVIDIA A40",
-    # "A4500": "NVIDIA RTX A4500",
+    "A40": "NVIDIA A40",
+    "A4500": "NVIDIA RTX A4500",
     # "RTX3080": "NVIDIA GeForce RTX 3080",
     # "RTX3070": "NVIDIA GeForce RTX 3070",
     # "RTX3080Ti": "NVIDIA GeForce RTX 3080 Ti",
     # "L4": "NVIDIA L4",
 }
+
+# Approximate RunPod on-demand cost per GPU-hour (USD).
+# Used to sort candidate GPUs cheapest-first within the same VRAM tier.
+# GPUs not listed here get a high default cost so they sort last.
+# Rates are indicative (community vs secure and region vary). Entries: ascending $/hr
+# (ties broken alphabetically by key).
+GPU_COST_PER_HOUR: Dict[str, float] = {
+    "A2000": 0.20,
+    "A5000": 0.27,
+    "A4000": 0.28,
+    "2000Ada": 0.29,
+    "RTX3070": 0.30,
+    "A4500": 0.32,
+    "A4000_SFF": 0.36,
+    "RTX3080": 0.36,
+    "L4": 0.39,
+    "RTX4070Ti": 0.39,
+    "RTX3080Ti": 0.41,
+    "A40": 0.44,
+    "RTX3090": 0.46,
+    "4000Ada": 0.48,
+    "A6000": 0.49,
+    "RTX3090Ti": 0.51,
+    "RTX4080": 0.59,
+    "RTX4090": 0.69,
+    "6000Ada": 0.77,
+    "L40S": 0.86,
+    "L40": 0.99,
+    "A5000_ADA": 1.02,
+    "A30": 1.05,
+    "A100": 1.39,
+    "A100S": 1.49,
+    "H100S": 2.69,
+    "H100N": 3.07,
+    "H200": 3.59,
+    "MI300X": 3.99,
+    "B200": 4.99,
+}
+_DEFAULT_GPU_COST = 999.0  # fallback for unlisted GPUs
 GPU_COUNT = 1
 allowed_cuda_versions = ["12.8"]
 HARDWARE_REFRESH_INTERVAL_SECONDS = int(
     os.getenv("OW_RUNPOD_HARDWARE_REFRESH_INTERVAL_SECONDS", "900")
 )
 HARDWARE_FAILURE_THRESHOLD = int(os.getenv("OW_RUNPOD_HARDWARE_FAILURE_THRESHOLD", "3"))
-HARDWARE_COOLDOWN_SECONDS = int(
-    os.getenv("OW_RUNPOD_HARDWARE_COOLDOWN_SECONDS", str(7 * 24 * 60 * 60))
+# Escalating provisioning-failure cooldowns (seconds). After each cooldown triggers,
+# the next uses the following rung; the final rung repeats for all later cooldowns.
+DEFAULT_HARDWARE_COOLDOWN_LADDER_SECONDS: tuple[int, ...] = (
+    1 * 60,
+    2 * 60,
+    5 * 60,
+    10 * 60,
+    20 * 60,
+    40 * 60,
+    80 * 60,
+    160 * 60,
+    360 * 60,
 )
+
+
+def _env_cooldown_ladder_seconds() -> tuple[int, ...]:
+    """Parse ``OW_RUNPOD_HARDWARE_COOLDOWN_LADDER_SECONDS`` (comma-separated seconds)."""
+    raw = os.getenv("OW_RUNPOD_HARDWARE_COOLDOWN_LADDER_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_HARDWARE_COOLDOWN_LADDER_SECONDS
+    parts = [int(p.strip()) for p in raw.split(",") if p.strip()]
+    if not parts:
+        return DEFAULT_HARDWARE_COOLDOWN_LADDER_SECONDS
+    return tuple(parts)
+
+
+HARDWARE_COOLDOWN_LADDER_SECONDS = _env_cooldown_ladder_seconds()
+# How long to pause all provisioning after a spending-limit error
+SPENDING_LIMIT_PAUSE_SECONDS = int(
+    os.getenv("OW_RUNPOD_SPENDING_LIMIT_PAUSE_SECONDS", "300")  # 5 minutes
+)
+# Patterns in RunPod error messages that indicate a spending limit
+SPENDING_LIMIT_ERROR_PATTERNS = [
+    "spending limit",
+    "spend limit",
+    "budget limit",
+    "exceeded your",
+]
 RUNPOD_CLOUD_TYPE = os.getenv("OW_RUNPOD_CLOUD_TYPE", "ALL").upper()
 RUNPOD_SUPPORT_PUBLIC_IP = (
     os.getenv("OW_RUNPOD_SUPPORT_PUBLIC_IP", "true").lower() == "true"
@@ -162,6 +246,23 @@ def parse_hardware_config(hardware_type: str) -> tuple[int, str]:
     return int(count), gpu.strip()
 
 
+def is_spending_limit_error(error: Exception | str) -> bool:
+    """Check whether an error message indicates a RunPod spending limit."""
+    msg = str(error).lower()
+    return any(pattern in msg for pattern in SPENDING_LIMIT_ERROR_PATTERNS)
+
+
+def _gpu_cost_sort_key(hardware_type: str) -> float:
+    """Return the approximate $/hr for a hardware type (e.g. '1x L40' or '2x A100').
+
+    Multi-GPU configs scale linearly.  GPUs missing from GPU_COST_PER_HOUR
+    sort last so newly-added GPUs are never silently preferred over known-cheap ones.
+    """
+    count, gpu_name = parse_hardware_config(hardware_type)
+    per_gpu = GPU_COST_PER_HOUR.get(gpu_name, _DEFAULT_GPU_COST)
+    return count * per_gpu
+
+
 @dataclass
 class HardwareFailureState:
     consecutive_failures: int = 0
@@ -169,25 +270,50 @@ class HardwareFailureState:
     last_failure_at: Optional[float] = None
     last_success_at: Optional[float] = None
     last_error: Optional[str] = None
+    #: Increments each time a cooldown is applied; drives ladder duration selection.
+    cooldown_escalation_level: int = 0
 
 
 class RunpodHardwareRegistry:
+    """RunPod GPU inventory cache with escalating failure cooldowns per hardware string."""
+
     def __init__(
         self,
         refresh_interval_seconds: int = HARDWARE_REFRESH_INTERVAL_SECONDS,
         failure_threshold: int = HARDWARE_FAILURE_THRESHOLD,
-        cooldown_seconds: int = HARDWARE_COOLDOWN_SECONDS,
+        spending_limit_pause_seconds: int = SPENDING_LIMIT_PAUSE_SECONDS,
+        cooldown_ladder_seconds: Optional[tuple[int, ...]] = None,
         now_fn: Optional[Callable[[], float]] = None,
-    ):
+    ) -> None:
+        """Build a registry.
+
+        Args:
+            refresh_interval_seconds: Minimum interval between RunPod inventory refreshes.
+            failure_threshold: Consecutive provisioning failures before a cooldown applies.
+            cooldown_ladder_seconds: Cooldown durations (seconds) per escalation level;
+                defaults to env / built-in ladder. The last entry repeats for later levels.
+            now_fn: Injectable clock for tests (returns unix time as float).
+        """
         self.refresh_interval_seconds = refresh_interval_seconds
         self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
+        self.spending_limit_pause_seconds = spending_limit_pause_seconds
+        resolved_ladder = (
+            cooldown_ladder_seconds
+            if cooldown_ladder_seconds is not None
+            else HARDWARE_COOLDOWN_LADDER_SECONDS
+        )
+        if not resolved_ladder:
+            raise ValueError("cooldown_ladder_seconds must be non-empty")
+        self.cooldown_ladder_seconds: tuple[int, ...] = resolved_ladder
         self.now_fn = now_fn or time.time
         self._last_refresh_at = 0.0
         self._discovered_config: Dict[int, List[str]] = {}
         self._hardware_config: Dict[int, List[str]] = {}
         self._failure_state: Dict[str, HardwareFailureState] = {}
         self._lock = RLock()
+        # Global pause: when a spending-limit error is detected, all provisioning
+        # is paused until this timestamp.
+        self._spending_limit_pause_until: float = 0.0
 
     def _now(self) -> float:
         return self.now_fn()
@@ -210,7 +336,7 @@ class RunpodHardwareRegistry:
         for memory_gb, hardware_types in discovered_config.items():
             available = [
                 hardware_type
-                for hardware_type in sorted(set(hardware_types))
+                for hardware_type in sorted(set(hardware_types), key=_gpu_cost_sort_key)
                 if not self._is_on_cooldown(hardware_type, now=now)
             ]
             if available:
@@ -258,11 +384,11 @@ class RunpodHardwareRegistry:
 
             now = self._now()
             if allowed_hardware:
-                candidates = []
-                for hardware_type in allowed_hardware:
-                    if not self._is_on_cooldown(hardware_type, now=now):
-                        candidates.append(hardware_type)
-                return candidates
+                return [
+                    hw
+                    for hw in allowed_hardware
+                    if not self._is_on_cooldown(hw, now=now)
+                ]
 
             candidates: List[str] = []
             for vram in sorted(self._hardware_config.keys()):
@@ -277,23 +403,52 @@ class RunpodHardwareRegistry:
             )
             state.consecutive_failures = 0
             state.cooldown_until = None
+            state.cooldown_escalation_level = 0
             state.last_success_at = self._now()
             state.last_error = None
             self._rebuild_hardware_config(self._discovered_config)
 
     def record_failure(self, hardware_type: str, error: Exception | str) -> bool:
         with self._lock:
+            now = self._now()
+
+            # If this is a spending-limit error, apply a global pause instead of
+            # penalising the individual hardware type.
+            if is_spending_limit_error(error):
+                self._spending_limit_pause_until = (
+                    now + self.spending_limit_pause_seconds
+                )
+                # Don't count spending-limit errors toward the per-hardware
+                # failure threshold — they are account-wide and transient.
+                return False
+
             state = self._failure_state.setdefault(
                 hardware_type, HardwareFailureState()
             )
             state.consecutive_failures += 1
-            state.last_failure_at = self._now()
+            state.last_failure_at = now
             state.last_error = str(error)
             cooldown_applied = False
             if state.consecutive_failures >= self.failure_threshold:
-                state.cooldown_until = state.last_failure_at + self.cooldown_seconds
+                ladder = self.cooldown_ladder_seconds
+                idx = min(state.cooldown_escalation_level, len(ladder) - 1)
+                duration_s = ladder[idx]
+                until_ts = state.last_failure_at + duration_s
+                state.cooldown_until = until_ts
                 state.consecutive_failures = 0
+                state.cooldown_escalation_level += 1
                 cooldown_applied = True
+                escalation_level = state.cooldown_escalation_level
+                logger.warning(
+                    "RunPod provisioning cooldown triggered: hardware=%s "
+                    "escalation_level=%s ladder_rung=%s/%s duration_s=%s until_utc=%s",
+                    hardware_type,
+                    escalation_level,
+                    idx + 1,
+                    len(ladder),
+                    duration_s,
+                    datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat(),
+                )
             self._rebuild_hardware_config(self._discovered_config)
             return cooldown_applied
 
@@ -304,6 +459,46 @@ class RunpodHardwareRegistry:
         if not self._is_on_cooldown(hardware_type):
             return None
         return state.cooldown_until
+
+    def is_spending_limit_paused(self) -> bool:
+        """Return True if provisioning is globally paused due to a spending-limit error."""
+        return self._now() < self._spending_limit_pause_until
+
+    def spending_limit_pause_until(self) -> float:
+        """Return the timestamp when the spending-limit pause expires (0 if not paused)."""
+        return self._spending_limit_pause_until
+
+    def get_cooldown_escalation_level(self, hardware_type: str) -> int:
+        """Return how many provisioning cooldown waves have completed for this hardware.
+
+        Resets to ``0`` on :meth:`record_success`. Increments each time a cooldown
+        is applied in :meth:`record_failure`.
+        """
+        with self._lock:
+            state = self._failure_state.get(hardware_type)
+            if state is None:
+                return 0
+            return state.cooldown_escalation_level
+
+    def get_active_cooldown_end_times(
+        self, hardware_types: List[str]
+    ) -> Dict[str, float]:
+        """Return ``cooldown_until`` epoch timestamps for types currently on cooldown.
+
+        Only includes entries from ``hardware_types`` that are still cooling down
+        after repeated provisioning failures.
+        """
+        with self._lock:
+            now = self._now()
+            out: Dict[str, float] = {}
+            for hw in hardware_types:
+                if not self._is_on_cooldown(hw, now=now):
+                    continue
+                state = self._failure_state.get(hw)
+                if state is None or state.cooldown_until is None:
+                    continue
+                out[hw] = state.cooldown_until
+            return out
 
 
 HARDWARE_REGISTRY = RunpodHardwareRegistry()

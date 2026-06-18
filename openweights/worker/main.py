@@ -5,6 +5,7 @@ import os
 import random
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from openweights.client import Files, OpenWeights, Run
 from openweights.client.decorators import supabase_retry
 from openweights.cluster.start_runpod import GPUs
 from openweights.worker.gpu_health_check import GPUHealthCheck
+from openweights.worker.gpu_reclaim import ForeignGpuHolderError, reclaim_gpu
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -139,6 +141,15 @@ class Worker:
                 }
             ).execute()
 
+            # Revert any orphaned in_progress jobs from a previous worker
+            # lifetime.  If this pod crashed (OOM, SIGKILL, power loss) the
+            # atexit handler never fires and the cluster manager may not
+            # notice if the pod restarts quickly with the same worker_id.
+            # Those jobs would stay in_progress forever — no worker is
+            # actually running them.  Reverting them here is safe: a freshly
+            # started worker process cannot be executing anything yet.
+            self._revert_orphaned_jobs()
+
             if not os.environ.get("IS_LOCAL"):
                 # Start background task for health check and job status monitoring
                 self.health_check_thread = threading.Thread(
@@ -159,6 +170,53 @@ class Worker:
             .eq("id", self.worker_id)
             .execute()
         )
+
+    @supabase_retry()
+    def _revert_orphaned_jobs(self):
+        """Revert any in_progress jobs assigned to this worker back to pending.
+
+        On a fresh start no job can legitimately be in_progress for this
+        worker_id.  Any such jobs are orphans from a previous crash.
+        """
+        orphaned_runs = (
+            self._ow._supabase.table("runs")
+            .select("id, job_id")
+            .eq("worker_id", self.worker_id)
+            .eq("status", "in_progress")
+            .execute()
+            .data
+        )
+        if not orphaned_runs:
+            logging.info("No orphaned in_progress jobs found for this worker.")
+            return
+
+        logging.warning(
+            f"Found {len(orphaned_runs)} orphaned in_progress job(s) from a "
+            f"previous worker lifetime. Reverting to pending..."
+        )
+        for run in orphaned_runs:
+            try:
+                # Mark the run as failed
+                self._ow._supabase.table("runs").update({"status": "failed"}).eq(
+                    "id", run["id"]
+                ).execute()
+
+                # Revert the job to pending (only if still in_progress for us)
+                self._ow._supabase.rpc(
+                    "update_job_status_if_in_progress",
+                    {
+                        "_job_id": run["job_id"],
+                        "_new_status": "pending",
+                        "_worker_id": self.worker_id,
+                        "_job_outputs": None,
+                        "_job_script": None,
+                    },
+                ).execute()
+                logging.info(
+                    f"Reverted orphaned job {run['job_id']} (run {run['id']}) to pending."
+                )
+            except Exception as e:
+                logging.error(f"Failed to revert orphaned job {run['job_id']}: {e}")
 
     @supabase_retry()
     def _get_job_status(self, job_id: str):
@@ -323,6 +381,8 @@ class Worker:
                 logging.info(
                     f"Worker {self.worker_id} acquired job {job['id']}, executing..."
                 )
+                if self.gpu_count > 0 and not self._reclaim_gpu_or_release(acquired_job):
+                    continue
                 self._execute_job(acquired_job)
             except KeyboardInterrupt:
                 logging.info("Worker interrupted by user. Shutting down...")
@@ -384,6 +444,45 @@ class Worker:
                 return j
         return suitable_jobs[0]
 
+    def _reclaim_gpu_or_release(self, job: dict) -> bool:
+        """Try to free leftover VRAM before running ``job``.
+
+        Returns ``True`` if the worker should proceed to execute ``job``.
+
+        On a foreign GPU holder we revert the job to ``pending`` so the
+        scheduler can place it on a different pod, and we shut this worker
+        down because it cannot host GPU jobs until the holder releases.
+
+        On a reclaim timeout (our own kill didn't free memory in time) we
+        revert the job and shut down too — the GPU is in a bad state.
+        """
+        try:
+            reclaim_gpu()
+            return True
+        except ForeignGpuHolderError as exc:
+            logging.error(
+                f"Foreign GPU holder detected before job {job['id']}: {exc}"
+            )
+        except RuntimeError as exc:
+            logging.error(
+                f"GPU reclaim failed before job {job['id']}: {exc}"
+            )
+        except Exception as exc:
+            logging.error(
+                f"Unexpected error during GPU reclaim before job {job['id']}: {exc}"
+            )
+            traceback.print_exc()
+            return True  # fail open: don't block jobs on diagnostic bugs
+
+        try:
+            self.update_job_status_if_in_progress(job["id"], "pending", None, None)
+        except Exception as exc:
+            logging.error(
+                f"Failed to revert job {job['id']} to pending after reclaim failure: {exc}"
+            )
+        self.shutdown_flag = True
+        return False
+
     def _execute_job(self, job):
         """Execute the job and update status in the database."""
         self.current_job = job
@@ -411,6 +510,22 @@ class Worker:
                     env = os.environ.copy()
                     env["OPENWEIGHTS_RUN_ID"] = str(self.current_run.id)
                     env["N_GPUS"] = str(self.gpu_count)
+                    repo_root = os.path.abspath(
+                        os.path.join(os.path.dirname(__file__), "..", "..")
+                    )
+                    existing_pythonpath = env.get("PYTHONPATH")
+                    env["PYTHONPATH"] = (
+                        f"{repo_root}{os.pathsep}{existing_pythonpath}"
+                        if existing_pythonpath
+                        else repo_root
+                    )
+                    python_bin_dir = os.path.dirname(sys.executable)
+                    existing_path = env.get("PATH", "")
+                    env["PATH"] = (
+                        f"{python_bin_dir}{os.pathsep}{existing_path}"
+                        if existing_path
+                        else python_bin_dir
+                    )
 
                     logging.info(f"Going to run script: {script}")
                     self.current_process = subprocess.Popen(
